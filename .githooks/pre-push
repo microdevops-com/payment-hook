@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# Pre-push hook for payment-hook project
+# This script runs code quality checks before allowing a push
+
+set -e
+
+echo "🔍 Running pre-push code quality checks..."
+
+TEST_IMAGE_NAME="payment-hook-test"
+
+echo "🔨 Building test image: ${TEST_IMAGE_NAME}"
+if ! docker build -t "${TEST_IMAGE_NAME}" .; then
+    echo "❌ Docker build failed!"
+    exit 1
+fi
+
+echo "✅ Docker build successful"
+
+# Function to run a code quality check
+run_check() {
+    local tool_name=$1
+    local command=$2
+    
+    echo "🔍 Running ${tool_name}..."
+    if ! docker run --rm -v "$(pwd):/src" -w /src "${TEST_IMAGE_NAME}" ${command}; then
+        echo "❌ ${tool_name} failed!"
+        return 1
+    fi
+    echo "✅ ${tool_name} passed"
+    return 0
+}
+
+# Track if any checks fail
+CHECKS_FAILED=false
+
+# Run Black formatter check (--check flag prevents actual formatting)
+if ! run_check "Black formatter" "black --check ."; then
+    echo "💡 Run 'docker run --rm -v \$(pwd):/src -w /src ${TEST_IMAGE_NAME} black .' to fix formatting"
+    CHECKS_FAILED=true
+fi
+
+# Run isort import sorter check (--check-only flag prevents actual sorting)
+if ! run_check "isort import sorter" "isort --check-only ."; then
+    echo "💡 Run 'docker run --rm -v \$(pwd):/src -w /src ${TEST_IMAGE_NAME} isort .' to fix imports"
+    CHECKS_FAILED=true
+fi
+
+# Run flake8 style checker
+if ! run_check "flake8 linter" "flake8 ."; then
+    echo "💡 Fix style issues reported by flake8"
+    CHECKS_FAILED=true
+fi
+
+# Run mypy type checker (more lenient for now)
+if ! run_check "mypy type checker" "mypy ."; then
+    echo "⚠️  MyPy issues detected"
+    CHECKS_FAILED=true
+fi
+
+# Final result
+if [ "$CHECKS_FAILED" = true ]; then
+    echo ""
+    echo "❌ Pre-push checks failed! Please fix the issues above before pushing."
+    echo ""
+    exit 1
+else
+    echo ""
+    echo "✅ All pre-push checks passed! Push allowed."
+    echo ""
+    exit 0
+fi
+
+# Clean up the test image
+echo "🧹 Cleaning up test image..."
+docker rmi "${TEST_IMAGE_NAME}" > /dev/null 2>&1 || true
