@@ -27,7 +27,7 @@ When a payment is made through Stripe, this service (`payment-hook`) performs th
 - Fina Production Certificates https://www.fina.hr/eng/finadigicert/ca-certificates
 - Stripe Test Api Keys https://dashboard.stripe.com/test/apikeys
 - Stripe Live Api Keys https://dashboard.stripe.com/apikeys
-- Another Open Source related project https://github.com/senko/fiskal-hr
+- Another Open Source related project https://github.com/senko/fiskal-hr and their [Integration Documentation](https://github.com/senko/fiskal-hr/blob/main/doc/integration.md) which helped a lot during development
 
 # 📁 Project Structure
 
@@ -57,7 +57,17 @@ This docker compose configuration is designed for local development and testing 
 
 Production deployment is intended to use docker image built from this repository but with separate ingress and database services, without stripe-cli service and docker compose.
 
-- Add `cert/` to the project root with FINA certificate files.
+- Add `cert/` to the project root with FINA certificate files:
+  - `cert/1111111.1.F1.p12` - your client certificate.
+  - `cert/ca_demo/demo2014_root_ca.pem` - download from https://www.fina.hr/finadigicert/certifikati-za-testiranje-i-demonstraciju/fina-demo-ca-certifikati
+  - `cert/ca_demo/demo2014_sub_ca.pem` - download from https://www.fina.hr/finadigicert/certifikati-za-testiranje-i-demonstraciju/fina-demo-ca-certifikati
+  - `cert/ca_demo/demo2020_sub_ca.pem` - download from https://www.fina.hr/finadigicert/certifikati-za-testiranje-i-demonstraciju/fina-demo-ca-certifikati
+  - `cert/ca/FinaRootCA.pem` - download from https://www.fina.hr/finadigicert/fina-ca-root-certifikati
+  - `cert/ca/FinaRDCCA2015.pem` - download from https://www.fina.hr/finadigicert/fina-ca-root-certifikati
+  - `cert/ca/FinaRDCCA2020.pem` - download from https://www.fina.hr/finadigicert/fina-ca-root-certifikati
+  - `cert/ca/FinaRDCCA2025.pem` - download from https://www.fina.hr/finadigicert/fina-ca-root-certifikati
+  - `cert/ca/cis.porezna-uprava.hr.pem` - download `cis.porezna-uprava.hr.cer` from https://porezna-uprava.gov.hr/hr/certifikati-za-preuzimanje/4549, rename to `.pem`
+  - `cert/ca/fiskalcis.pem` - download `fiskalcis.cer` from https://porezna-uprava.gov.hr/hr/certifikati-za-preuzimanje/4549, rename to `.pem`, remove extra header before `-----BEGIN CERTIFICATE-----`
 - Create a `.env` file in the project root, use `.env.example` as a template.
 - Configure S3-compatible storage credentials:
   ```
@@ -111,7 +121,17 @@ Without the currency override, the default USD payment will be rejected with err
 
 ## Verify the Result
 
-Check the database for the stored event and the fiscal receipt. Also verify that files are stored in your S3 bucket with the structure:
+Check the database for the stored event and the fiscal receipt.
+
+```bash
+docker compose exec pg bash -c "echo 'SELECT * FROM fina_receipt ORDER BY id DESC LIMIT 5;' | psql -U paymenthook"
+```
+
+Database table `fina_receipt` should contain a new record with ZKI and JIR values.
+
+`payment_time`, `receipt_created`, `receipt_updated` are of `timestamptz` type, that means they are stored in UTC timezone.
+
+Also verify that files are stored in your S3 bucket with the structure:
 
 ```
 YYYY-MM-DD-HH-MM-SS-stripe-payment-intent-{event_id}-{hostname}-{pid}/
@@ -123,6 +143,8 @@ YYYY-MM-DD-HH-MM-SS-stripe-payment-intent-{event_id}-{hostname}-{pid}/
 └── fina-response.yaml      # Parsed response data
 ```
 
+Timestamps in those files should be in your configured timezone (e.g., Europe/Zagreb), as Fina requires Croatian local time for fiscal receipts.
+
 **Folder naming includes:**
 - UTC timestamp for chronological ordering
 - Event ID for traceability to Stripe event
@@ -130,6 +152,116 @@ YYYY-MM-DD-HH-MM-SS-stripe-payment-intent-{event_id}-{hostname}-{pid}/
 - Process ID to handle multiple workers/containers
 
 This prevents conflicts when the same Stripe event is sent to multiple environments (e.g., via stripe-cli to local dev and webhook to production simultaneously).
+
+# 🛠️ CLI Tools for Manual Operations
+
+The `fina_cli.py` tool provides manual control over FINA fiscalization operations:
+
+## Retry Failed Receipt
+
+If fiscalization fails (e.g., FINA service unavailable), you can retry it manually:
+
+```bash
+docker compose exec payment-hook python fina_cli.py --retry-receipt 123
+```
+
+This will:
+- Fetch the failed receipt from the database (by receipt number)
+- Use the original payment time and amount
+- Retry the fiscalization process
+- Update the database with the new result (ZKI/JIR)
+
+**When to use:**
+- FINA service was temporarily unavailable
+- Network issues during initial fiscalization
+- Certificate or configuration errors that have been fixed
+- Any receipt with `status='failed'` or `status='processing'`
+
+## Create Manual Receipt
+
+Create a fiscal receipt manually without a Stripe webhook:
+
+```bash
+# Simple - with current time
+docker compose exec payment-hook python fina_cli.py --create-receipt --amount 100.00
+
+# With specific payment time
+docker compose exec payment-hook python fina_cli.py --create-receipt --amount 150.50 \
+    --payment-time "2025-01-15 14:30:00" --order-id "order_123"
+
+# With custom identifiers
+docker compose exec payment-hook python fina_cli.py --create-receipt --amount 200.00 \
+    --stripe-id "pi_custom123" --order-id "order_456"
+```
+
+**Arguments:**
+- `--amount` (required): Payment amount in EUR
+- `--payment-time` (optional): Payment timestamp in format "YYYY-MM-DD HH:MM:SS" (defaults to current time in FINA_TIMEZONE)
+- `--order-id` (optional): Order/invoice identifier
+- `--stripe-id` (optional): Payment ID (auto-generated as `manual_<uuid>` if not provided)
+
+**When to use:**
+- Manual payment received (bank transfer, cash, etc.) that needs fiscalization
+- Fixing missing fiscal receipts for completed payments
+- Testing FINA integration without triggering Stripe webhooks
+- Migrating historical receipts into the system
+
+**Important notes:**
+- Currency is always EUR (FINA requirement)
+- Receipt number is auto-assigned using the same sequence as webhook processing
+- Payment time without timezone is assumed to be in FINA_TIMEZONE
+- All data is stored in database and S3 storage, same as webhook processing
+- Files are stored in S3 with folder name: `YYYY-MM-DD-HH-MM-SS-fina-manual-{payment_id}-{hostname}-{pid}`
+
+## View Help
+
+```bash
+docker compose exec payment-hook python fina_cli.py --help
+```
+
+## Test SSL Connection to FINA
+
+Before deploying to production or when switching between demo/production FINA endpoints, you can verify that your CA certificates are correct:
+
+```bash
+# Test demo endpoint
+docker compose exec payment-hook python test_ssl_connection.py \
+    --ca-dir cert/ca_demo \
+    --endpoint https://cistest.apis-it.hr:8449/FiskalizacijaServiceTest
+
+# Test production endpoint
+docker compose exec payment-hook python test_ssl_connection.py \
+    --ca-dir cert/ca_prod \
+    --endpoint https://cis.porezna-uprava.hr:8449/FiskalizacijaService
+```
+
+**What it does:**
+- Tests SSL handshake with the FINA endpoint
+- Validates CA certificate chain
+- Does NOT send any fiscal data (safe to test production)
+- Does NOT require client certificate
+
+**When to use:**
+- Before deploying to production (verify CA certificates are correct)
+- When switching from demo to production endpoint
+- Troubleshooting SSL connection issues
+- After updating CA certificates
+
+**Expected output:**
+```
+✅ SSL handshake successful!
+   Status code: 405
+   Server responded: 232 bytes
+
+🎉 SSL connection test PASSED
+```
+
+Status code 405 (Method Not Allowed) is expected - we're testing SSL, not sending actual requests.
+
+**If it fails:**
+- Check that all required CA certificates are present in the directory
+- Verify certificates are in `.pem` format
+- Ensure you're using the correct CA certificates for the endpoint (demo CA for demo endpoint, production CA for production endpoint)
 
 # 🚢 Production/Test Deployment
 
@@ -209,14 +341,14 @@ docker run -d \
   -p 8000:8000 \
   -v /path/to/cert:/app/cert:ro \
   -e APP_ENV=production \
-  -e TIMEZONE=Europe/Zagreb \
   -e S3_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxx \
   -e S3_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
   -e S3_ENDPOINT_URL=https://hel1.your-objectstorage.com \
   -e S3_BUCKET_NAME=my-bucket-name \
   -e P12_PATH=cert/1111111.1.F1.p12 \
   -e P12_PASSWORD=xxxxxxxxxxxxxxx \
-  -e FINA_ENDPOINT=https://cistest.apis.hr/app/ci/rc \
+  -e FINA_TIMEZONE=Europe/Zagreb \
+  -e FINA_ENDPOINT=https://cistest.apis-it.hr:8449/FiskalizacijaServiceTest \
   -e OIB_COMPANY=11111111111 \
   -e OIB_OPERATOR=11111111111 \
   -e LOCATION_ID=Online \
@@ -237,10 +369,12 @@ docker run -d \
 
 **Environment variables:**
 - `APP_ENV` - Set to `production` or `development`/`dev`
-- `FINA_ENDPOINT` - Use test endpoint for staging: `https://cistest.apis.hr/app/ci/rc`
+- `FINA_ENDPOINT` - Use test endpoint for staging: `https://cistest.apis-it.hr:8449/FiskalizacijaServiceTest`
 - `FINA_ENDPOINT` - Use production endpoint for production: `https://cis.porezna-uprava.hr:8449/FiskalizacijaService`
 - `STRIPE_WEBHOOK_SECRET` - Obtain from Stripe Dashboard (see next step)
 - All other variables as documented in the Configuration section
+
+See [the specification](doc/fina/Fiskalizacija - Tehnicka specifikacija za korisnike 2.5.pdf) for more details on FINA settings, endpoints, and certificate requirements.
 
 ### 4. Configure Stripe Webhook
 

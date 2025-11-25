@@ -102,10 +102,12 @@ This is a Python Flask application that processes payment webhooks and integrate
 6. All transaction files are organized in S3 with consistent folder structure
 
 ### File Structure
-- `app.py` - Main Flask application (~130 lines)
-- `fina.py` - FINA fiscalization logic (~280 lines)
-- `s3_storage.py` - S3 storage module (~70 lines)
+- `app.py` - Main Flask application (~400 lines)
+- `fina.py` - FINA fiscalization logic (~500 lines)
+- `fina_cli.py` - CLI tool for manual FINA operations (~350 lines)
+- `s3_storage.py` - S3 storage module (~100 lines)
 - `migrate.py` - Database migration system (~150 lines)
+- `test_ssl_connection.py` - SSL connection testing utility (~180 lines)
 - `migrations/` - SQL migration files
 - `doc/` - FINA technical specifications and schemas
 - `cert/` - FINA certificates (not committed to git)
@@ -135,7 +137,11 @@ This prevents file conflicts when the same Stripe event is sent to multiple envi
 - `fina_receipt` table - Stores FINA fiscal receipt data
   - Primary key: `id` (serial)
   - Unique constraint: `(year, receipt_number)`
-  - Fields: `year`, `location_id`, `register_id`, `receipt_number`, `order_id`, `stripe_id`, `amount`, `currency`, `zki`, `jir`, `created_at`
+  - Fields: `year`, `location_id`, `register_id`, `receipt_number`, `order_id`, `stripe_id`, `amount`, `currency`, `zki`, `jir`, `payment_time`, `receipt_created`, `receipt_updated`, `status`
+  - `payment_time` - The original Stripe payment timestamp (TIMESTAMPTZ)
+  - `receipt_created` - Database row creation timestamp (TIMESTAMPTZ)
+  - `receipt_updated` - Database row last update timestamp (TIMESTAMPTZ)
+  - `status` - Receipt processing status ('pending', 'processing', 'completed', 'failed')
 - `schema_migrations` table - Tracks applied migrations
 
 **Note**: Table was renamed from `receipt` to `fina_receipt` to support future fiscal systems (e.g., `germany_receipt`, etc.)
@@ -145,10 +151,15 @@ This prevents file conflicts when the same Stripe event is sent to multiple envi
 STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
 PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DB
 P12_PATH, P12_PASSWORD (FINA certificate)
+FINA_CA_DIR_PATH (directory containing FINA CA certificates in .pem format)
+  - For demo/test environment: cert/ca_demo
+  - For production environment: cert/ca (or cert/ca_prod)
+FINA_TIMEZONE (e.g., Europe/Zagreb)
 FINA_ENDPOINT (test/production URL)
+  - Demo: https://cistest.apis-it.hr:8449/FiskalizacijaServiceTest
+  - Production: https://cis.porezna-uprava.hr:8449/FiskalizacijaService
 OIB_COMPANY, OIB_OPERATOR (Croatian tax IDs)
 LOCATION_ID, REGISTER_ID (fiscal identifiers)
-TIMEZONE (e.g., Europe/Zagreb)
 S3_ACCESS_KEY, S3_SECRET_KEY, S3_ENDPOINT_URL, S3_BUCKET_NAME (S3-compatible storage)
 ```
 
@@ -158,8 +169,20 @@ GUNICORN_WORKERS=2 (number of Gunicorn worker processes)
 GUNICORN_TIMEOUT=60 (request timeout in seconds)
 ```
 
+### CLI Tools
+- **fina_cli.py** - Manual FINA operations
+  - `--retry-receipt <receipt_number>` - Retry fiscalization for a failed receipt
+  - `--create-receipt --amount <amount>` - Create manual fiscal receipt (for non-Stripe payments)
+  - Supports custom payment times, order IDs, and Stripe IDs
+  - Useful for fixing failed receipts, manual payments, and testing
+- **test_ssl_connection.py** - SSL connection testing
+  - `--ca-dir <path>` - Directory containing CA certificates
+  - `--endpoint <url>` - FINA endpoint to test
+  - Tests SSL handshake without sending fiscal data
+  - Useful for verifying certificate configuration before deployment
+
 ### Docker Architecture
-- **Development**: Docker Compose with nginx proxy, app container, PostgreSQL, and migration service
+- **Development**: Docker Compose with nginx proxy, app container, PostgreSQL, stripe-cli, and migration service
 - **Production**: Single container with Gunicorn, external nginx and database
 - **Volumes**: `cert/`, `migrations/` directories are mounted for persistence; `payment/` and `receipt/` data now stored in S3
 - **Networking**: App runs on port 8000 inside container, nginx proxies on port 8080
