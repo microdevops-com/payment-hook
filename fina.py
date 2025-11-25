@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def get_config():
     return {
-        "cet": ZoneInfo(os.environ["TIMEZONE"]),
+        "fina_timezone": ZoneInfo(os.environ["FINA_TIMEZONE"]),
         "p12_path": os.environ["P12_PATH"],
         "p12_password": os.environ["P12_PASSWORD"],
         "fina_endpoint": os.environ["FINA_ENDPOINT"],
@@ -49,27 +49,25 @@ def get_db_connection():
     )
 
 
-def reserve_receipt_number(year, location_id, register_id, order_id, stripe_id, amount, currency):
+def reserve_receipt_number(year, location_id, register_id, order_id, stripe_id, amount, currency, payment_time):
     """
     Atomically reserve the next receipt number by inserting a new row with 'processing' status.
     Uses PostgreSQL sequence for atomic receipt number generation, eliminating race conditions.
     """
-    cet = ZoneInfo(os.environ["TIMEZONE"])
-    created_at = datetime.now(cet)
-
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Insert new row with 'processing' status - sequence automatically assigns receipt_number
+            # receipt_created and receipt_updated are set automatically by database defaults
             cur.execute(
                 """
                 INSERT INTO fina_receipt (
                     year, location_id, register_id,
                     order_id, stripe_id, amount, currency,
-                    zki, jir, created_at, status
+                    zki, jir, payment_time, status
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, 'processing')
                 RETURNING receipt_number
                 """,
-                [year, location_id, register_id, order_id, stripe_id, amount, currency, created_at],
+                [year, location_id, register_id, order_id, stripe_id, amount, currency, payment_time],
             )
             row = cur.fetchone()
             receipt_number = row["receipt_number"]
@@ -88,7 +86,7 @@ def update_receipt_with_fiscalization(stripe_id, zki, jir, status):
             cur.execute(
                 """
                 UPDATE fina_receipt
-                SET zki = %s, jir = %s, status = %s
+                SET zki = %s, jir = %s, status = %s, receipt_updated = CURRENT_TIMESTAMP
                 WHERE stripe_id = %s
                 """,
                 [zki, jir, status, stripe_id],
@@ -117,9 +115,9 @@ def cleanup_stale_processing_records(max_age_minutes=30):
             cur.execute(
                 """
                 UPDATE fina_receipt
-                SET status = 'failed'
+                SET status = 'failed', receipt_updated = CURRENT_TIMESTAMP
                 WHERE status = 'processing'
-                AND created_at < NOW() - INTERVAL '%s minutes'
+                AND receipt_created < NOW() - INTERVAL '%s minutes'
                 RETURNING stripe_id, receipt_number
                 """,
                 [max_age_minutes],
@@ -166,7 +164,7 @@ def process_fina_fiscalization(
 
     # Step 1: Reserve receipt number by inserting record with 'processing' status
     receipt_number = reserve_receipt_number(
-        year, location_id, register_id, invoice_id, payment_id, payment_amount, payment_currency
+        year, location_id, register_id, invoice_id, payment_id, payment_amount, payment_currency, payment_time
     )
 
     try:
@@ -222,19 +220,19 @@ def generate_zki(oib, dt, br, pos, ur, amount, private_key):
     return hashlib.md5(signed).hexdigest()
 
 
-def build_receipt(message_id, node_id, time, zki, total, receipt_number, config):
+def build_receipt(message_id, node_id, request_time, payment_time, zki, total, receipt_number, config):
     receipt = f"""<tns:RacunZahtjev xmlns:tns="http://www.apis-it.hr/fin/2012/types/f73"
              Id="{node_id}"
              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
              xsi:schemaLocation="http://www.apis-it.hr/fin/2012/types/f73 ../schema/FiskalizacijaSchema.xsd">
         <tns:Zaglavlje>
             <tns:IdPoruke>{message_id}</tns:IdPoruke>
-            <tns:DatumVrijeme>{time}</tns:DatumVrijeme>
+            <tns:DatumVrijeme>{request_time}</tns:DatumVrijeme>
         </tns:Zaglavlje>
         <tns:Racun>
             <tns:Oib>{config['oib_company']}</tns:Oib>
             <tns:USustPdv>true</tns:USustPdv>
-            <tns:DatVrijeme>{time}</tns:DatVrijeme>
+            <tns:DatVrijeme>{payment_time}</tns:DatVrijeme>
             <tns:OznSlijed>P</tns:OznSlijed>
             <tns:BrRac>
                 <tns:BrOznRac>{receipt_number}</tns:BrOznRac>
@@ -298,30 +296,48 @@ def wrap_soap(xml_signed):
 
 
 def fiscalize_request(payload, config, cert_pem, key_pem):
+    import glob
     import tempfile
 
     headers = {"Content-Type": "text/xml; charset=utf-8"}
 
+    # Combine CA certificates from the directory
+    ca_dir = os.environ.get("FINA_CA_DIR_PATH")
+    if not ca_dir:
+        raise ValueError("FINA_CA_DIR_PATH environment variable is required for SSL verification")
+
+    ca_pem_files = glob.glob(os.path.join(ca_dir, "*.pem"))
+    if not ca_pem_files:
+        raise ValueError(f"No .pem files found in {ca_dir}")
+
+    # Read and combine all CA certificates
+    combined_ca = b""
+    for ca_file in sorted(ca_pem_files):
+        with open(ca_file, "rb") as f:
+            combined_ca += f.read()
+            combined_ca += b"\n"  # Ensure separation between certificates
+
+    logger.info(f"Loaded {len(ca_pem_files)} CA certificate(s) from {ca_dir}")
+
     # Use in-memory temporary files that are automatically cleaned up
-    with tempfile.NamedTemporaryFile(mode="wb") as cert_file, tempfile.NamedTemporaryFile(mode="wb") as key_file:
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".pem") as cert_file, tempfile.NamedTemporaryFile(
+        mode="wb", suffix=".pem"
+    ) as key_file, tempfile.NamedTemporaryFile(mode="wb", suffix=".pem") as ca_bundle_file:
         cert_file.write(cert_pem)
         key_file.write(key_pem)
+        ca_bundle_file.write(combined_ca)
         cert_file.flush()
         key_file.flush()
-
-        # Only disable SSL verification in development environment
-        ssl_verify = os.environ.get("APP_ENV", "production").lower() not in ["dev", "development"]
+        ca_bundle_file.flush()
 
         r = requests.post(
             config["fina_endpoint"],
             data=payload.encode(),
             headers=headers,
             cert=(cert_file.name, key_file.name),
-            verify=ssl_verify,
+            verify=ca_bundle_file.name,
         )
 
-        if not ssl_verify:
-            logger.warning("⚠️  SSL verification disabled (development mode)")
         logger.info(f"📤 Sent to FINA: {r.status_code}")
         return r.text
         # Files are automatically deleted when exiting the 'with' block
@@ -386,8 +402,14 @@ def extract_jir(xml_string):
 def fiscalize(payment_time, payment_amount, receipt_number, shared_folder_path) -> dict:
     config = get_config()
 
+    # Format payment time (original transaction time)
     payment_time_xml = payment_time.strftime("%d.%m.%YT%H:%M:%S")
     payment_time_zki = payment_time.strftime("%Y%m%d_%H%M%S")
+
+    # Get current time for request timestamp (Zaglavlje)
+    fina_timezone = ZoneInfo(os.environ["FINA_TIMEZONE"])
+    request_time = datetime.now(fina_timezone)
+    request_time_xml = request_time.strftime("%d.%m.%YT%H:%M:%S")
 
     try:
         cert_pem, key_pem, private_key = extract_cert_key(config["p12_path"], config["p12_password"])
@@ -418,6 +440,7 @@ def fiscalize(payment_time, payment_amount, receipt_number, shared_folder_path) 
         receipt_content = build_receipt(
             request_id,
             signature_node_id,
+            request_time_xml,
             payment_time_xml,
             zki,
             f"{payment_amount:.2f}",

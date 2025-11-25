@@ -78,7 +78,7 @@ def process_payment_intent_webhook():
         Tuple of (response_dict, status_code)
     """
     stripe_webhook_secret = os.environ["STRIPE_WEBHOOK_SECRET"]
-    cet = ZoneInfo(os.environ["TIMEZONE"])
+    fina_timezone = ZoneInfo(os.environ["FINA_TIMEZONE"])
 
     payload = request.get_data()
     sig_header = request.headers.get("Stripe-Signature")
@@ -109,7 +109,7 @@ def process_payment_intent_webhook():
     payment_id = payment_intent.get("id")
     payment_time = payment_intent.get("created")
     payment_time_utc = datetime.fromtimestamp(payment_time, tz=ZoneInfo("UTC"))
-    payment_time_local = payment_time_utc.astimezone(cet)
+    payment_time_local = payment_time_utc.astimezone(fina_timezone)
     payment_amount = payment_intent.get("amount", 0) / 100
     payment_currency = payment_intent.get("currency")
 
@@ -244,7 +244,6 @@ def health_check():
 
     # Required environment variables
     required_env_vars = [
-        "TIMEZONE",
         "S3_ACCESS_KEY",
         "S3_SECRET_KEY",
         "S3_ENDPOINT_URL",
@@ -252,6 +251,8 @@ def health_check():
         "STRIPE_WEBHOOK_SECRET",
         "P12_PATH",
         "P12_PASSWORD",
+        "FINA_CA_DIR_PATH",
+        "FINA_TIMEZONE",
         "FINA_ENDPOINT",
         "OIB_COMPANY",
         "OIB_OPERATOR",
@@ -275,7 +276,7 @@ def health_check():
                     "environment": "incomplete",
                     "missing_vars": missing_vars,
                     "error": "Required environment variables not set",
-                    "timestamp": datetime.now(ZoneInfo(os.environ.get("TIMEZONE", "UTC"))).isoformat(),
+                    "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
                 }
             ),
             503,
@@ -305,7 +306,7 @@ def health_check():
                     "status": "healthy",
                     "database": "connected",
                     "environment": "complete",
-                    "timestamp": datetime.now(ZoneInfo(os.environ.get("TIMEZONE", "UTC"))).isoformat(),
+                    "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
                 }
             ),
             200,
@@ -319,7 +320,7 @@ def health_check():
                     "database": "disconnected",
                     "environment": "complete",
                     "error": "Database connection failed",
-                    "timestamp": datetime.now(ZoneInfo(os.environ.get("TIMEZONE", "UTC"))).isoformat(),
+                    "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
                 }
             ),
             503,
