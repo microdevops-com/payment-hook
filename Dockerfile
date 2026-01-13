@@ -22,6 +22,12 @@ COPY *.py .
 # Copy migrations directory
 COPY migrations/ migrations/
 
+# Copy templates directory for PDF receipts
+COPY templates/ templates/
+
+# Copy fonts directory for PDF generation
+COPY fonts/ fonts/
+
 # Make migration script executable
 RUN chmod +x migrate.py
 

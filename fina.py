@@ -49,7 +49,9 @@ def get_db_connection():
     )
 
 
-def reserve_receipt_number(year, location_id, register_id, order_id, stripe_id, amount, currency, payment_time):
+def reserve_receipt_number(
+    year, location_id, register_id, order_id, stripe_id, amount, currency, payment_time, s3_folder_path
+):
     """
     Atomically reserve the next receipt number by inserting a new row with 'processing' status.
     Uses PostgreSQL sequence for atomic receipt number generation, eliminating race conditions.
@@ -63,11 +65,11 @@ def reserve_receipt_number(year, location_id, register_id, order_id, stripe_id, 
                 INSERT INTO fina_receipt (
                     year, location_id, register_id,
                     order_id, stripe_id, amount, currency,
-                    zki, jir, payment_time, status
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, 'processing')
+                    zki, jir, payment_time, status, s3_folder_path
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, 'processing', %s)
                 RETURNING receipt_number
                 """,
-                [year, location_id, register_id, order_id, stripe_id, amount, currency, payment_time],
+                [year, location_id, register_id, order_id, stripe_id, amount, currency, payment_time, s3_folder_path],
             )
             row = cur.fetchone()
             receipt_number = row["receipt_number"]
@@ -164,7 +166,15 @@ def process_fina_fiscalization(
 
     # Step 1: Reserve receipt number by inserting record with 'processing' status
     receipt_number = reserve_receipt_number(
-        year, location_id, register_id, invoice_id, payment_id, payment_amount, payment_currency, payment_time
+        year,
+        location_id,
+        register_id,
+        invoice_id,
+        payment_id,
+        payment_amount,
+        payment_currency,
+        payment_time,
+        shared_folder_path,
     )
 
     try:

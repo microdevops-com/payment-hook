@@ -37,11 +37,14 @@ Apart standard docker python project files:
 payment-hook/
 ├── app.py            # Flask app that receives webhooks
 ├── fina.py           # FINA fiscalization logic
+├── fina_cli.py       # CLI tool for manual operations and PDF generation
 ├── s3_storage.py     # S3-compatible storage module
 ├── migrate.py        # Database migration system
 ├── .env              # Secrets (Stripe, FINA, S3 settings) - should be added during deployment
 ├── cert/             # FINA certificate files - should be added during deployment
-└── migrations/       # SQL migration files
+├── migrations/       # SQL migration files
+├── templates/        # Markdown templates for PDF receipts
+└── fonts/            # Font files for PDF generation (TTF format)
 ```
 
 # ⚖ Requirements
@@ -135,13 +138,16 @@ Also verify that files are stored in your S3 bucket with the structure:
 
 ```
 YYYY-MM-DD-HH-MM-SS-stripe-payment-intent-{event_id}-{hostname}-{pid}/
-├── stripe-webhook.json     # Raw Stripe webhook payload
-├── stripe-webhook.yaml     # Parsed webhook data
-├── fina-request.xml        # SOAP request sent to FINA
-├── fina-request.yaml       # Parsed request data
-├── fina-response.xml       # SOAP response from FINA
-└── fina-response.yaml      # Parsed response data
+├── stripe-webhook.json         # Raw Stripe webhook payload
+├── stripe-webhook.yaml         # Parsed webhook data
+├── fina-request.xml            # SOAP request sent to FINA
+├── fina-request.yaml           # Parsed request data
+├── fina-response.xml           # SOAP response from FINA
+├── fina-response.yaml          # Parsed response data
+└── fina-receipt-{order_id}.pdf # PDF receipt (generated asynchronously via CLI tool)
 ```
+
+**Note:** PDF receipts are generated asynchronously after fiscalization. See the "PDF Receipt Generation" section below for details.
 
 Timestamps in those files should be in your configured timezone (e.g., Europe/Zagreb), as Fina requires Croatian local time for fiscal receipts.
 
@@ -471,7 +477,191 @@ If duplicate fiscal receipts have been issued:
 
 **Best practice:** Always ensure only one instance receives webhooks for any given Stripe payment.
 
-## Troubleshooting
+# 📄 PDF Receipt Generation
+
+The application supports generating PDF receipts from fiscalized transactions. PDF generation is **asynchronous** and **decoupled** from the fiscalization process to avoid any risks during the critical FINA communication.
+
+## Overview
+
+When a payment is successfully fiscalized through FINA, the system:
+1. Stores fiscal receipt data in the database (ZKI, JIR, receipt number, etc.)
+2. Saves XML request/response files to S3 storage
+3. Sets `pdf_status='pending'` for the receipt
+
+Later, PDF receipts can be generated using the CLI tool:
+1. Fetch receipt data from database
+2. Render Markdown template with Jinja2 variable substitution
+3. Convert Markdown → HTML → PDF using fpdf2 and markdown-it-py
+4. Generate QR code compliant with Croatian tax authority specifications
+5. Upload PDF to S3 storage alongside fiscal receipt files
+6. Update database with `pdf_status='completed'` and `pdf_created` timestamp
+
+**Key Design Principle:** PDF generation is **completely separate** from fiscalization. If PDF generation fails, the fiscal receipt is still valid and stored in FINA's system.
+Also if receipt template needs to be updated in the future, PDFs can be regenerated without re-fiscalizing the payment.
+
+## Database Schema for PDF Tracking
+
+The `fina_receipt` table includes columns for tracking PDF generation:
+
+- `s3_folder_path` (TEXT): Full S3 folder path where fiscal receipt files are stored
+- `pdf_status` (VARCHAR): PDF generation status - 'pending', 'processing', 'completed', 'failed'
+- `pdf_created` (TIMESTAMPTZ): Timestamp when PDF was successfully generated (NULL if not generated)
+
+**Important:** The `receipt_updated` timestamp is only modified when FINA fiscalization data changes. PDF generation operations only update `pdf_status` and `pdf_created` columns.
+
+## CLI Commands
+
+### Generate PDF for Single Receipt
+
+Generate a PDF receipt for a specific fiscal receipt by its database ID:
+
+```bash
+docker compose exec payment-hook python fina_cli.py \
+    --generate-pdf <receipt_id> \
+    --template example.md \
+    --font RobotoMonoNerdFont-Medium
+```
+
+**Arguments:**
+- `--generate-pdf` (required): Database ID of the fiscal receipt
+- `--template` (required): Path to Markdown template file within templates/ directory
+- `--font` (required): Font name for PDF rendering (must support Croatian characters: š, ć, č, ž, đ) within the fonts/ directory
+
+**Example:**
+```bash
+docker compose exec payment-hook python fina_cli.py \
+    --generate-pdf 123 \
+    --template example.md \
+    --font RobotoMonoNerdFont-Medium
+```
+
+### Generate PDFs for Multiple Receipts (Batch)
+
+Generate PDFs for all receipts with `pdf_status='pending'`:
+
+```bash
+docker compose exec payment-hook python fina_cli.py \
+    --generate-pending-pdfs \
+    --template example.md \
+    --font RobotoMonoNerdFont-Medium
+```
+
+This is useful for:
+- Processing accumulated pending receipts
+- Running as a scheduled cron job
+- Recovering from PDF generation failures
+
+## Template System
+
+PDF receipts are generated from Markdown templates using Jinja2 variable substitution.
+
+**Template Variables:**
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `{{ receipt_number }}` | Full FINA receipt number | `2025/Online/1/123` |
+| `{{ order_id }}` | Order/invoice identifier | `order_abc123` |
+| `{{ amount }}` | Payment amount in EUR | `12.34` |
+| `{{ payment_time }}` | Payment timestamp (FINA timezone) | `15.01.2025 14:30:45` |
+| `{{ zki }}` | FINA protective code (ZKI) | `a1b2c3d4e5f6...` |
+| `{{ jir }}` | FINA unique identifier (JIR) | `f6e5d4c3-b2a1-...` |
+| `{{ verification_link }}` | Clickable link to tax authority verification | HTML anchor tag |
+| `{{ qr_code }}` | QR code placeholder | `<!--QR_CODE_PLACEHOLDER-->` |
+| `{{ location_id }}` | FINA location identifier | `Online` |
+| `{{ register_id }}` | FINA register identifier | `1` |
+
+**Template Example:** see [templates/example.md](templates/example.md).
+
+**Template Location:** Templates are stored in the `templates/` directory.
+
+For dev environment, `templates/` is mounted as a Docker volume for easy editing without rebuilding the image.
+
+For production, templates are copied into the image at build time.
+
+## QR Code Specifications
+
+Generated QR codes comply with Croatian tax authority requirements and ISO/IEC 15415 standard:
+
+- **Size:** 20mm × 20mm (75 pixels at 96 DPI)
+- **Error Correction Level:** L (Low - 7% error correction)
+- **Border:** 4 modules (quiet zone)
+- **Format:** PNG image embedded in PDF
+- **Content:** Verification URL to Croatian tax authority portal
+
+**Verification URL Format:**
+```
+https://porezna.gov.hr/rn?jir={JIR}&datv={YYYYMMDD_HHMM}&izn={cents}
+```
+
+**Parameters:**
+- `jir`: FINA unique identifier (JIR) from fiscal receipt
+- `datv`: Payment date and time in format `YYYYMMDD_HHMM` (FINA timezone)
+- `izn`: Payment amount in cents (e.g., 1234 for 12.34 EUR)
+
+**Example:**
+```
+https://porezna.gov.hr/rn?jir=f6e5d4c3-b2a1-1234-5678-a1b2c3d4e5f6&datv=20250115_1430&izn=1234
+```
+
+Customers can scan the QR code or click the verification link to verify the fiscal receipt on the Croatian tax authority website.
+
+## Font Requirements
+
+PDF generation requires fonts that support Croatian characters (š, ć, č, ž, đ) and other Unicode characters.
+
+**Fonts Tested:**
+- **RobotoMonoNerdFont-Medium** (recommended) - see [Nerd Fonts](https://github.com/ryanoasis/nerd-fonts).
+- **DejaVuSans** - usually comes pre-installed in many systems.
+
+Fonts are automatically discovered by fpdf2 when loaded from the `fonts/` directory.
+
+## S3 Storage Structure with PDFs
+
+After PDF generation, the S3 folder structure includes the PDF file:
+
+```
+YYYY-MM-DD-HH-MM-SS-stripe-payment-intent-{event_id}-{hostname}-{pid}/
+├── stripe-webhook.json         # Raw Stripe webhook payload
+├── stripe-webhook.yaml         # Parsed webhook data
+├── fina-request.xml            # SOAP request sent to FINA
+├── fina-request.yaml           # Parsed request data
+├── fina-response.xml           # SOAP response from FINA
+├── fina-response.yaml          # Parsed response data
+└── fina-receipt-{order_id}.pdf # ← Generated PDF receipt
+```
+
+**PDF Filename Convention:**
+- Format: `fina-receipt-{order_id}.pdf`
+- `{order_id}` is sanitized for S3 compatibility (special characters replaced with hyphens)
+- Example: `fina-receipt-order-abc123.pdf`
+
+**Folder Path Storage:**
+- Full S3 folder path is stored in the `s3_folder_path` column during fiscalization
+- This eliminates the need for glob searches when generating PDFs later
+- Folder names include hostname and process ID to prevent conflicts across environments
+
+## Verifying PDF Generation
+
+Check PDF generation status in the database:
+
+```bash
+# View PDF status for all receipts
+docker compose exec pg bash -c "echo 'SELECT id, order_id, pdf_status, pdf_created FROM fina_receipt ORDER BY id DESC LIMIT 10;' | psql -U paymenthook"
+
+# Find pending PDFs
+docker compose exec pg bash -c "echo \"SELECT id, order_id, s3_folder_path FROM fina_receipt WHERE pdf_status='pending' ORDER BY id DESC;\" | psql -U paymenthook"
+
+# Count PDFs by status
+docker compose exec pg bash -c "echo 'SELECT pdf_status, COUNT(*) FROM fina_receipt GROUP BY pdf_status;' | psql -U paymenthook"
+```
+
+Check S3 storage to verify PDF files are uploaded:
+- Log into your S3-compatible storage (Hetzner, AWS S3, MinIO, etc.)
+- Navigate to the bucket configured in `S3_BUCKET_NAME`
+- Find the transaction folder (using `s3_folder_path` from database)
+- Verify `fina-receipt-{order_id}.pdf` exists alongside XML/YAML files
+
+# Troubleshooting
 
 - **Webhook signature validation fails**: Ensure nginx has `proxy_buffering off` and `proxy_request_buffering off`
 - **Database connection errors**: Verify PostgreSQL credentials and network connectivity

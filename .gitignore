@@ -1,4 +1,8 @@
 __pycache__
 cert
+templates/*
+!templates/example.md
 .env*
 !.env.example
+fonts/*
+tmp/*

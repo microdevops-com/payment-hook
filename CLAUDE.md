@@ -55,6 +55,24 @@ docker compose exec payment-hook python migrate.py create add_new_column
 docker compose exec stripe-cli sh -c 'stripe trigger payment_intent.succeeded --override payment_intent:currency=eur --override payment_intent:amount=1234 --api-key $STRIPE_API_SECRET_KEY'
 ```
 
+### PDF Receipt Generation
+```bash
+# Generate PDF for specific receipt
+docker compose exec payment-hook python fina_cli.py \
+  --generate-pdf 1 \
+  --template template.md \
+  --font RobotoMonoNerdFont-Medium
+
+# Batch generate PDFs for all pending receipts
+docker compose exec payment-hook python fina_cli.py \
+  --generate-pending-pdfs \
+  --template template.md \
+  --font RobotoMonoNerdFont-Medium
+
+# Can be run via cron for automatic processing
+# Example crontab: */5 * * * * docker compose exec -T payment-hook python fina_cli.py --generate-pending-pdfs --template template.md --font RobotoMonoNerdFont-Medium
+```
+
 ## Architecture Overview
 
 This is a Python Flask application that processes payment webhooks and integrates them with fiscal systems. Currently supports **Stripe → FINA** flow, but designed for extensibility to support multiple payment providers and fiscal systems.
@@ -101,14 +119,41 @@ This is a Python Flask application that processes payment webhooks and integrate
    - Saves fiscal receipt files to same S3 folder as webhook data
 6. All transaction files are organized in S3 with consistent folder structure
 
+### PDF Receipt Generation (Async)
+
+After successful fiscalization, PDF receipts are generated asynchronously to avoid impacting the fiscalization process:
+
+1. **Fiscalization completes** → `pdf_status` set to 'pending' in database
+2. **CLI tool runs** → `fina_cli.py --generate-pending-pdfs` (can be triggered manually or via cron)
+3. **For each pending receipt**:
+   - Fetch receipt data from database (JIR, ZKI, payment details)
+   - Generate Croatian tax authority verification URL with JIR
+   - Create QR code (20mm × 20mm, Error Correction Level L, ISO/IEC 15415 compliant)
+   - Render Jinja2 template with receipt data
+   - Convert Markdown → HTML → PDF using fpdf2
+   - Upload PDF to same S3 folder as fiscal receipt files
+   - Update `pdf_status` to 'completed' and set `pdf_created` timestamp
+
+**Key Features:**
+- **Template-based**: Markdown templates with Jinja2 variables (`{{ order_id }}`, `{{ jir }}`, etc.)
+- **Unicode support**: Uses TrueType fonts (e.g., RobotoMonoNerdFont-Medium) for Croatian characters
+- **Compliance**: QR codes meet Croatian tax authority requirements (2×2cm, Level L error correction)
+- **Verification**: QR code and clickable link to `https://porezna.gov.hr/rn?jir=...&datv=...&izn=...`
+- **Filename format**: `fina-receipt-{order_id}.pdf` (order_id sanitized for S3)
+- **Idempotent**: Can retry failed PDFs without affecting fiscal data
+
+**Important**: `receipt_updated` timestamp is NOT modified during PDF generation - it only reflects when FINA fiscalization data was last updated.
+
 ### File Structure
 - `app.py` - Main Flask application (~400 lines)
 - `fina.py` - FINA fiscalization logic (~500 lines)
-- `fina_cli.py` - CLI tool for manual FINA operations (~350 lines)
+- `fina_cli.py` - CLI tool for manual FINA operations and PDF generation (~650 lines)
 - `s3_storage.py` - S3 storage module (~100 lines)
 - `migrate.py` - Database migration system (~150 lines)
 - `test_ssl_connection.py` - SSL connection testing utility (~180 lines)
 - `migrations/` - SQL migration files
+- `templates/` - Markdown templates for PDF receipt generation
+- `fonts/` - TrueType fonts for PDF generation (Unicode support)
 - `doc/` - FINA technical specifications and schemas
 - `cert/` - FINA certificates (not committed to git)
 
@@ -121,7 +166,8 @@ YYYY-MM-DD-HH-MM-SS-stripe-payment-intent-{event_id}-{hostname}-{pid}/
 ├── fina-request.xml        # SOAP request sent to FINA
 ├── fina-request.yaml       # Parsed request data
 ├── fina-response.xml       # SOAP response from FINA
-└── fina-response.yaml      # Parsed response data
+├── fina-response.yaml      # Parsed response data
+└── fina-receipt-{order_id}.pdf  # PDF receipt (generated asynchronously)
 ```
 
 **Folder naming convention:**
@@ -137,11 +183,14 @@ This prevents file conflicts when the same Stripe event is sent to multiple envi
 - `fina_receipt` table - Stores FINA fiscal receipt data
   - Primary key: `id` (serial)
   - Unique constraint: `(year, receipt_number)`
-  - Fields: `year`, `location_id`, `register_id`, `receipt_number`, `order_id`, `stripe_id`, `amount`, `currency`, `zki`, `jir`, `payment_time`, `receipt_created`, `receipt_updated`, `status`
+  - Fields: `year`, `location_id`, `register_id`, `receipt_number`, `order_id`, `stripe_id`, `amount`, `currency`, `zki`, `jir`, `payment_time`, `receipt_created`, `receipt_updated`, `status`, `s3_folder_path`, `pdf_status`, `pdf_created`
   - `payment_time` - The original Stripe payment timestamp (TIMESTAMPTZ)
   - `receipt_created` - Database row creation timestamp (TIMESTAMPTZ)
-  - `receipt_updated` - Database row last update timestamp (TIMESTAMPTZ)
+  - `receipt_updated` - Database row last update timestamp (TIMESTAMPTZ) - only updated when FINA data changes
   - `status` - Receipt processing status ('pending', 'processing', 'completed', 'failed')
+  - `s3_folder_path` - Full S3 folder path where receipt files are stored (TEXT)
+  - `pdf_status` - PDF generation status ('pending', 'processing', 'completed', 'failed')
+  - `pdf_created` - Timestamp when PDF was successfully generated (TIMESTAMPTZ)
 - `schema_migrations` table - Tracks applied migrations
 
 **Note**: Table was renamed from `receipt` to `fina_receipt` to support future fiscal systems (e.g., `germany_receipt`, etc.)
@@ -170,11 +219,13 @@ GUNICORN_TIMEOUT=60 (request timeout in seconds)
 ```
 
 ### CLI Tools
-- **fina_cli.py** - Manual FINA operations
+- **fina_cli.py** - Manual FINA operations and PDF generation
   - `--retry-receipt <receipt_number>` - Retry fiscalization for a failed receipt
   - `--create-receipt --amount <amount>` - Create manual fiscal receipt (for non-Stripe payments)
+  - `--generate-pdf <receipt_id> --template <template.md> --font <font_name>` - Generate PDF receipt for specific receipt
+  - `--generate-pending-pdfs --template <template.md> --font <font_name>` - Batch generate PDFs for all pending receipts
   - Supports custom payment times, order IDs, and Stripe IDs
-  - Useful for fixing failed receipts, manual payments, and testing
+  - Useful for fixing failed receipts, manual payments, testing, and PDF generation
 - **test_ssl_connection.py** - SSL connection testing
   - `--ca-dir <path>` - Directory containing CA certificates
   - `--endpoint <url>` - FINA endpoint to test
@@ -184,13 +235,13 @@ GUNICORN_TIMEOUT=60 (request timeout in seconds)
 ### Docker Architecture
 - **Development**: Docker Compose with nginx proxy, app container, PostgreSQL, stripe-cli, and migration service
 - **Production**: Single container with Gunicorn, external nginx and database
-- **Volumes**: `cert/`, `migrations/` directories are mounted for persistence; `payment/` and `receipt/` data now stored in S3
+- **Volumes**: `cert/`, `migrations/`, `templates/`, `fonts/` directories are mounted for persistence; all receipt data stored in S3
 - **Networking**: App runs on port 8000 inside container, nginx proxies on port 8080
 - **Health checks**: PostgreSQL health checks ensure database is ready before starting app
 - **Migration service**: Runs once on startup, applies pending migrations, then exits
 
 ### Dependencies
-Python 3.12+ with Flask, Stripe SDK, PostgreSQL (psycopg2), cryptography, xmlsec, lxml for XML processing and FINA integration. boto3 for S3-compatible storage. Gunicorn for WSGI server. Development tools: black (formatter), isort (import sorter), flake8 (linter), mypy (type checker). No python-dotenv needed (Docker handles environment variables).
+Python 3.12+ with Flask, Stripe SDK, PostgreSQL (psycopg2), cryptography, xmlsec, lxml for XML processing and FINA integration. boto3 for S3-compatible storage. Gunicorn for WSGI server. fpdf2, markdown-it-py, qrcode, and Pillow for PDF receipt generation with Unicode support. Jinja2 for template rendering. Development tools: black (formatter), isort (import sorter), flake8 (linter), mypy (type checker). No python-dotenv needed (Docker handles environment variables).
 
 ### Code Quality Tools
 
@@ -274,7 +325,9 @@ When adding new features:
 - Pre-push git hook automatically runs code quality checks before allowing pushes
 - The system handles Croatian VAT-exempt transactions only
 - All fiscal receipts and webhook data are stored permanently in S3 for audit compliance
+- PDF receipts are generated asynchronously via CLI tool (can be automated with cron)
 - Certificate files in cert/ directory are required but not committed to git
 - Database migrations run automatically on `docker compose up`
 - Files are stored in S3-compatible storage (Hetzner Object Storage) instead of local directories
+- Templates and fonts directories support multiple clients with different receipt designs
 - No virtual environment setup needed - Docker handles all dependencies

@@ -7,6 +7,9 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ./cert:/app/cert:ro
+      - ./migrations:/app/migrations # Even though migrations are copied in the image, this needed for dev purposes
+      - ./templates:/app/templates # Template files for PDF receipt generation
+      - ./fonts:/app/fonts # Font files for PDF generation
     env_file:
       - .env
     environment:
